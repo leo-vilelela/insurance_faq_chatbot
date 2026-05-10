@@ -257,8 +257,8 @@ def clean_response(response: str) -> str:
     return cleaned
 
 def translate_to_english(query: str, client: OpenAI) -> str:
+    """Traduz a query para inglês para melhorar a busca no CSV."""
     try:
-        """Traduz a query para inglês para melhorar a busca no CSV."""
         response = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             max_tokens=100,
