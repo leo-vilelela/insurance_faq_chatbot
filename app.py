@@ -158,12 +158,38 @@ hr { border-color: var(--border) !important; }
 # ── Load data ─────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Carregando base de conhecimento...")
 def load_knowledge_base():
-    data_path = Path(__file__).parent / "data" / "insuranceqa_completo.csv"
-    if not data_path.exists():
-        st.error(f"❌ Arquivo não encontrado: {data_path}\n\nColoque o CSV em `data/insuranceqa_completo.csv`")
+    import csv
+    data_dir = Path(__file__).parent / "data"
+    csv_files = list(data_dir.glob("*.csv"))
+
+    if not csv_files:
+        st.error("❌ Nenhum CSV encontrado em `data/`. Adicione ao menos um arquivo.")
         st.stop()
-    df = pd.read_csv(data_path)
+
+    frames = []
+    for csv_path in csv_files:
+        print(f"Carregando {csv_path}...")
+        try:
+            # Usa engine='python' para melhor tolerância com CSVs mal-formatados
+            df = pd.read_csv(csv_path, engine='python', on_bad_lines='skip', encoding='utf-8')
+            
+            # aceita CSVs que tenham ao menos as colunas obrigatórias
+            if {"pergunta", "resposta"}.issubset(df.columns):
+                if "categoria" not in df.columns:
+                    df["categoria"] = csv_path.stem  # usa o nome do arquivo como categoria
+                frames.append(df)
+            else:
+                st.warning(f"⚠️ '{csv_path.name}' ignorado — precisa ter colunas 'pergunta' e 'resposta'.")
+        except Exception as e:
+            st.warning(f"⚠️ Erro ao ler '{csv_path.name}': {e}")
+
+    if not frames:
+        st.error("❌ Nenhum CSV válido encontrado. Verifique o formato dos arquivos.")
+        st.stop()
+
+    df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["pergunta", "resposta"])
+    df = df.drop_duplicates(subset=["pergunta", "resposta"])
     return df
 
 
@@ -202,7 +228,7 @@ def retrieve_context(df, query: str, category_filter: str, top_k: int = 5) -> li
 def build_prompt(query: str, context: list[dict]) -> str:
     ctx_text = ""
     for i, item in enumerate(context, 1):
-        ctx_text += f"\n[{i}] Categoria: {item['categoria']}\nPergunta similar: {item['pergunta']}\nResposta: {item['resposta']}\n"
+        ctx_text += f"\n---\nCategoria: {item['categoria']}\nPergunta similar: {item['pergunta']}\nResposta: {item['resposta']}\n"
 
     return f"""Você é um assistente especializado em seguros. Use as informações da base de conhecimento abaixo para responder à pergunta do usuário de forma clara, precisa e em português do Brasil.
 
@@ -212,12 +238,59 @@ BASE DE CONHECIMENTO:
 INSTRUÇÕES:
 - Responda sempre em português do Brasil
 - Seja claro e objetivo
+- NÃO cite números de referência como [1], [2], [3] na sua resposta
+- NÃO mencione as fontes diretamente no texto
 - Se a base não cobrir completamente a pergunta, diga o que sabe e recomende consultar um corretor
 - Não invente informações
 - Use linguagem acessível, sem jargões desnecessários
 
 PERGUNTA DO USUÁRIO: {query}"""
 
+
+def clean_response(response: str) -> str:
+    """Remove referências numeradas como [1], [2], [3], etc. da resposta."""
+    import re
+    # Remove padrões como [1], [2], [123], etc.
+    cleaned = re.sub(r'\[\d+\]', '', response)
+    # Remove espaços extras deixados pela remoção
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+def translate_to_english(query: str, client: OpenAI) -> str:
+    try:
+        """Traduz a query para inglês para melhorar a busca no CSV."""
+        response = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Translate the following question to English. "
+                    f"Return ONLY the translated question, nothing else.\n\n{query}"
+                )
+            }]
+        )
+        msg = response.choices[0].message
+
+        # Tenta content normal primeiro
+        if msg.content:
+            print(f"Content: '{msg.content.strip()}'")
+            return msg.content.strip()
+
+        # Modelos de raciocínio (DeepSeek-R1, etc.) às vezes só preenchem reasoning
+        # Extrai a segunda frase entre aspas do reasoning como fallback
+        if hasattr(msg, "reasoning") and msg.reasoning:
+            import re
+            matches = re.findall(r'"([^"]+\?)"', msg.reasoning)
+            if len(matches) > 1:
+                print(f"Matches: '{matches[1].strip()}'")
+                return matches[1].strip()
+            elif matches:
+                print(f"Matches: '{matches[0].strip()}'")
+                return matches[0].strip()
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return query
 
 # ── OpenRouter client (OpenAI-compatible) ─────────────────────────────────────
 OPENROUTER_MODEL = "openrouter/auto"   # router automático — escolhe o melhor modelo gratuito
@@ -285,22 +358,57 @@ if "messages" not in st.session_state:
 if "contexts" not in st.session_state:
     st.session_state.contexts = []
 
+def process_user_question(prompt: str):
+    """Processa uma pergunta do usuário: recupera contexto e gera resposta."""
+    query_for_search = translate_to_english(prompt, client)
+    # Retrieve
+    context = retrieve_context(df, query_for_search, category_filter, top_k)
+    st.session_state.contexts.append(context)
+
+    # Generate
+    with st.spinner("Consultando base de conhecimento..."):
+        full_prompt = build_prompt(prompt, context)
+        response = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            max_tokens=1000,
+            messages=[{"role": "user", "content": full_prompt}]
+        )
+        answer = response.choices[0].message.content
+        answer = clean_response(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.rerun()
+
+
 # Suggested questions
 if not st.session_state.messages:
     st.markdown("**💡 Sugestões para começar:**")
     suggestions = [
-        "What does life insurance cover?",
-        "How does auto insurance deductible work?",
-        "What is the difference between HMO and PPO health insurance?",
-        "When should I get long-term care insurance?",
+        "O que o seguro de vida cobre?",
+        "Como funciona a franquia do seguro auto?",
+        "Qual a diferença entre seguro saúde HMO e PPO?",
+        "Quando devo contratar seguro de cuidados de longo prazo?",
     ]
     cols = st.columns(2)
     for i, suggestion in enumerate(suggestions):
         if cols[i % 2].button(suggestion, use_container_width=True, key=f"sug_{i}"):
             st.session_state.messages.append({"role": "user", "content": suggestion})
+            print(f"Sugestão selecionada: {suggestion}")
+            with st.spinner("⏳ Processando sua pergunta..."):
+                query_for_search = translate_to_english(suggestion, client)
+                context = retrieve_context(df, query_for_search, category_filter, top_k)
+                st.session_state.contexts.append(context)
+                full_prompt = build_prompt(suggestion, context)
+                response = client.chat.completions.create(
+                    model=OPENROUTER_MODEL,
+                    max_tokens=1000,
+                    messages=[{"role": "user", "content": full_prompt}]
+                )
+                answer = response.choices[0].message.content
+                answer = clean_response(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
             st.rerun()
 
-st.markdown("---")
 
 # Chat history
 chat_col, ctx_col = st.columns([2, 1])
@@ -313,25 +421,7 @@ with chat_col:
     # Input
     if prompt := st.chat_input("Digite sua pergunta sobre seguros..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-
-        # Retrieve
-        context = retrieve_context(df, prompt, category_filter, top_k)
-        st.session_state.contexts.append(context)
-
-        # Generate
-        with st.chat_message("assistant", avatar="🛡️"):
-            with st.spinner("Consultando base de conhecimento..."):
-                full_prompt = build_prompt(prompt, context)
-                response = client.chat.completions.create(
-                    model=OPENROUTER_MODEL,
-                    max_tokens=1000,
-                    messages=[{"role": "user", "content": full_prompt}]
-                )
-                answer = response.choices[0].message.content
-
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.rerun()
+        process_user_question(prompt)
 
 with ctx_col:
     if st.session_state.contexts:
