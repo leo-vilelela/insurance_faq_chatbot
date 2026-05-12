@@ -259,8 +259,9 @@ def clean_response(response: str) -> str:
 def translate_to_english(query: str, client: OpenAI) -> str:
     """Traduz a query para inglês para melhorar a busca no CSV."""
     try:
+        TRANSLATION_MODEL = "baidu/cobuddy:free"
         response = client.chat.completions.create(
-            model=OPENROUTER_MODEL,
+            model=TRANSLATION_MODEL,
             max_tokens=100,
             messages=[{
                 "role": "user",
@@ -293,10 +294,13 @@ def translate_to_english(query: str, client: OpenAI) -> str:
         return query
 
 # ── OpenRouter client (OpenAI-compatible) ─────────────────────────────────────
-OPENROUTER_MODEL = "openrouter/auto"   # router automático — escolhe o melhor modelo gratuito
+OPENROUTER_MODEL = "openrouter/free"   # router automático — escolhe o melhor modelo gratuito
 # Alternativas gratuitas específicas (descomente para fixar um modelo):
-# OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
-# OPENROUTER_MODEL = "deepseek/deepseek-r1:free"
+# OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free" X
+# OPENROUTER_MODEL = "google/gemma-3-27b-it:free" X
+# OPENROUTER_MODEL = "qwen/qwen3-235b-a22b:free" X
+# OPENROUTER_MODEL = "mistralai/mistral-small-3.1-24b-instruct:free" X
+# OPENROUTER_MODEL = "deepseek/deepseek-r1:free" X
 # OPENROUTER_MODEL = "qwen/qwen3-235b-a22b:free"
 # OPENROUTER_MODEL = "mistralai/mistral-small-3.1-24b-instruct:free"
 
@@ -361,22 +365,27 @@ if "contexts" not in st.session_state:
 def process_user_question(prompt: str):
     """Processa uma pergunta do usuário: recupera contexto e gera resposta."""
     query_for_search = translate_to_english(prompt, client)
+    print(f"Query1: {query_for_search}")
     # Retrieve
     context = retrieve_context(df, query_for_search, category_filter, top_k)
     st.session_state.contexts.append(context)
 
     # Generate
-    with st.spinner("Consultando base de conhecimento..."):
-        full_prompt = build_prompt(prompt, context)
-        response = client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": full_prompt}]
-        )
-        answer = response.choices[0].message.content
-        answer = clean_response(answer)
+    try:
+        with st.spinner("Consultando base de conhecimento..."):
+            full_prompt = build_prompt(prompt, context)
+            print(f"Full prompt: {full_prompt}")
+            response = client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": full_prompt}]
+            )
+            answer = response.choices[0].message.content
+            answer = clean_response(answer)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+    except Exception as e:
+        st.error(f"Erro ao processar a pergunta: {e}")
     st.rerun()
 
 
@@ -395,18 +404,25 @@ if not st.session_state.messages:
             st.session_state.messages.append({"role": "user", "content": suggestion})
             print(f"Sugestão selecionada: {suggestion}")
             with st.spinner("⏳ Processando sua pergunta..."):
-                query_for_search = translate_to_english(suggestion, client)
-                context = retrieve_context(df, query_for_search, category_filter, top_k)
-                st.session_state.contexts.append(context)
-                full_prompt = build_prompt(suggestion, context)
-                response = client.chat.completions.create(
-                    model=OPENROUTER_MODEL,
-                    max_tokens=1000,
-                    messages=[{"role": "user", "content": full_prompt}]
-                )
-                answer = response.choices[0].message.content
-                answer = clean_response(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                try:
+                    query_for_search = translate_to_english(suggestion, client)
+                    print(f"Query2: {query_for_search}")
+                    context = retrieve_context(df, query_for_search, category_filter, top_k)
+                    print(f"Context: {context}")
+                    st.session_state.contexts.append(context)
+                    full_prompt = build_prompt(suggestion, context)
+                    print(f"Full prompt: {full_prompt}")
+                    response = client.chat.completions.create(
+                        model=OPENROUTER_MODEL,
+                        max_tokens=1000,
+                        messages=[{"role": "user", "content": full_prompt}]
+                    )
+                    print("Response: OK")
+                    answer = response.choices[0].message.content
+                    answer = clean_response(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"Erro ao processar a pergunta: {e}")
             st.rerun()
 
 
