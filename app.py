@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from openai import OpenAI
+import html
 import os
 from pathlib import Path
 
@@ -198,6 +199,9 @@ def get_categories(df):
     return sorted(df["categoria"].unique().tolist())
 
 
+MIN_RELEVANCE_SCORE = 8
+
+
 def retrieve_context(df, query: str, category_filter: str, top_k: int = 5) -> list[dict]:
     """Simple keyword-based retrieval (works without embeddings)."""
     if category_filter != "Todas":
@@ -205,24 +209,43 @@ def retrieve_context(df, query: str, category_filter: str, top_k: int = 5) -> li
     else:
         subset = df
 
+    if subset.empty:
+        return []
+
+    import re
+    stopwords = {
+        "about", "after", "also", "and", "are", "because", "before",
+        "between", "can", "could", "does", "explain", "for", "from", "has",
+        "have", "how", "insurance", "into", "more", "policy", "policies",
+        "should", "tell", "than", "that", "the", "their", "there", "these",
+        "this", "what", "when", "where", "which", "why", "will", "with",
+        "work", "works", "would", "you", "your",
+        "como", "com", "das", "deve", "dos", "entre", "essa", "esse",
+        "isso", "mais", "para", "pela", "pelo", "por", "qual", "quais",
+        "quando", "que", "seguro", "seguros", "sobre", "uma",
+    }
     query_lower = query.lower()
-    keywords = [w for w in query_lower.split() if len(w) > 3]
+    keywords = list(dict.fromkeys([
+        word for word in re.findall(r"\b\w+\b", query_lower)
+        if len(word) > 2 and word not in stopwords
+    ]))
 
     if not keywords:
-        return subset.sample(min(top_k, len(subset))).to_dict("records")
+        return []
 
-    def score(row):
-        text = (row["pergunta"] + " " + row["resposta"]).lower()
-        return sum(text.count(kw) for kw in keywords)
+    scored_rows = []
+    for row in subset.to_dict("records"):
+        text = f"{row['pergunta']} {row['resposta']}".lower()
+        matched_keywords = [kw for kw in keywords if kw in text]
+        relevance_score = sum(text.count(kw) for kw in matched_keywords)
 
-    subset = subset.copy()
-    subset["_score"] = subset.apply(score, axis=1)
-    top = subset[subset["_score"] > 0].nlargest(top_k, "_score")
+        if relevance_score >= MIN_RELEVANCE_SCORE:
+            row["relevance_score"] = int(relevance_score)
+            row["matched_keywords"] = matched_keywords
+            scored_rows.append(row)
 
-    if top.empty:
-        top = subset.sample(min(top_k, len(subset)))
-
-    return top.drop(columns=["_score"]).to_dict("records")
+    scored_rows.sort(key=lambda item: item["relevance_score"], reverse=True)
+    return scored_rows[:top_k]
 
 
 def build_prompt(query: str, context: list[dict]) -> str:
@@ -306,7 +329,14 @@ OPENROUTER_MODEL = "openrouter/free"   # router automático — escolhe o melhor
 
 @st.cache_resource
 def get_client():
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    try:
+        api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    except Exception:
+        api_key = ""
+
+    if not api_key:
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+
     if not api_key:
         st.error("❌ OPENROUTER_API_KEY não configurada. Veja o README para instruções.")
         st.stop()
@@ -362,13 +392,26 @@ if "messages" not in st.session_state:
 if "contexts" not in st.session_state:
     st.session_state.contexts = []
 
+NO_CONTEXT_ANSWER = (
+    "Não encontrei contexto confiável na base de conhecimento para responder essa "
+    "pergunta com segurança. Recomendo consultar um corretor ou especialista qualificado."
+)
+API_ERROR_ANSWER = (
+    "Não consegui consultar o modelo neste momento. Tente novamente em instantes "
+    "ou consulte um corretor ou especialista qualificado."
+)
+
 def process_user_question(prompt: str):
     """Processa uma pergunta do usuário: recupera contexto e gera resposta."""
-    query_for_search = translate_to_english(prompt, client)
-    print(f"Query1: {query_for_search}")
-    # Retrieve
-    context = retrieve_context(df, query_for_search, category_filter, top_k)
-    st.session_state.contexts.append(context)
+    with st.spinner("Consultando base de conhecimento..."):
+        query_for_search = translate_to_english(prompt, client)
+        print(f"Query: {query_for_search}")
+        context = retrieve_context(df, query_for_search, category_filter, top_k)
+        st.session_state.contexts.append(context)
+
+    if not context:
+        st.session_state.messages.append({"role": "assistant", "content": NO_CONTEXT_ANSWER})
+        st.rerun()
 
     # Generate
     try:
@@ -385,7 +428,8 @@ def process_user_question(prompt: str):
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
     except Exception as e:
-        st.error(f"Erro ao processar a pergunta: {e}")
+        print(f"Generation error: {e}")
+        st.session_state.messages.append({"role": "assistant", "content": API_ERROR_ANSWER})
     st.rerun()
 
 
@@ -403,27 +447,7 @@ if not st.session_state.messages:
         if cols[i % 2].button(suggestion, use_container_width=True, key=f"sug_{i}"):
             st.session_state.messages.append({"role": "user", "content": suggestion})
             print(f"Sugestão selecionada: {suggestion}")
-            with st.spinner("⏳ Processando sua pergunta..."):
-                try:
-                    query_for_search = translate_to_english(suggestion, client)
-                    print(f"Query2: {query_for_search}")
-                    context = retrieve_context(df, query_for_search, category_filter, top_k)
-                    print(f"Context: {context}")
-                    st.session_state.contexts.append(context)
-                    full_prompt = build_prompt(suggestion, context)
-                    print(f"Full prompt: {full_prompt}")
-                    response = client.chat.completions.create(
-                        model=OPENROUTER_MODEL,
-                        max_tokens=1000,
-                        messages=[{"role": "user", "content": full_prompt}]
-                    )
-                    print("Response: OK")
-                    answer = response.choices[0].message.content
-                    answer = clean_response(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except Exception as e:
-                    st.error(f"Erro ao processar a pergunta: {e}")
-            st.rerun()
+            process_user_question(suggestion)
 
 
 # Chat history
@@ -443,12 +467,26 @@ with ctx_col:
     if st.session_state.contexts:
         st.markdown("**📚 Fontes consultadas**")
         latest_ctx = st.session_state.contexts[-1]
-        for item in latest_ctx:
-            st.markdown(f"""
-            <div class="source-card">
-                <div class="src-category">🏷️ {item['categoria']}</div>
-                <div class="src-question">"{item['pergunta'][:80]}..."</div>
-            </div>
-            """, unsafe_allow_html=True)
+        if latest_ctx:
+            for item in latest_ctx:
+                category = html.escape(str(item.get("categoria", "")))
+                question = str(item.get("pergunta", ""))
+                if len(question) > 120:
+                    question = f"{question[:120]}..."
+                question = html.escape(question)
+                score = item.get("relevance_score", 0)
+                matched_keywords = ", ".join(str(kw) for kw in item.get("matched_keywords", []))
+                matched_keywords = html.escape(matched_keywords or "nenhuma")
+
+                st.markdown(f"""
+                <div class="source-card">
+                    <div class="src-category">🏷️ {category}</div>
+                    <div class="src-question">Pergunta similar: "{question}"</div>
+                    <div class="src-question">Relevância: {score}</div>
+                    <div class="src-question">Palavras-chave: {matched_keywords}</div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.markdown('<p style="color:var(--muted);font-size:0.85rem">Nenhuma fonte confiável foi encontrada para a última pergunta.</p>', unsafe_allow_html=True)
     else:
         st.markdown('<p style="color:var(--muted);font-size:0.85rem">As fontes da base de conhecimento aparecerão aqui após sua primeira pergunta.</p>', unsafe_allow_html=True)
