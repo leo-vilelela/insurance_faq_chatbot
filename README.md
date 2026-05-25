@@ -48,8 +48,15 @@ Obtenha sua chave **gratuitamente** em: https://openrouter.ai/keys
 
 ### Modelos gratuitos disponíveis
 No `app.py`, a variável `OPENROUTER_MODEL` controla o modelo usado.
-O padrão `openrouter/auto` escolhe automaticamente o melhor disponível.
+O projeto usa `openrouter/free` por padrão para desenvolvimento e testes sem custo.
 Para fixar um modelo específico, descomente uma das linhas no código.
+
+## Como funciona o RAG
+
+- A pergunta do usuário é traduzida para inglês antes da recuperação de contexto.
+- A recuperação é baseada em palavras-chave, sem embeddings ou banco vetorial nesta versão.
+- Quando nenhuma fonte confiável é encontrada, o app responde com uma mensagem controlada, reduzindo alucinações e evitando chamadas desnecessárias ao modelo de geração.
+- Uma melhoria futura é usar embeddings com FAISS ou outra busca vetorial para recuperar contexto por similaridade semântica.
 
 ### 5. Adicione o CSV na pasta data/
 Coloque o arquivo `insuranceqa_completo.csv` em `data/`.
@@ -67,7 +74,7 @@ Acesse: http://localhost:8501
 3. Conecte seu repositório GitHub
 4. Em **Advanced settings > Secrets**, adicione:
    ```
-   ANTHROPIC_API_KEY = "sk-ant-sua-chave-aqui"
+   OPENROUTER_API_KEY = "sk-or-v1-sua-chave-aqui"
    ```
 5. Clique em **Deploy**
 
